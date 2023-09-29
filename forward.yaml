@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kptunnel-{tunnel_id}
+  labels:
+    app: kptunnel-{tunnel_id}
+    tunnel: {tunnel_id}
+spec:
+  containers:
+  - name: kptunnel
+    image: kptunnel
+    command:
+      - /kptunnel
+      - wsserver
+      - :1234
+      - {bind_address}:{listen_port},{forward_to_host}:{forward_to_port}
+    ports:
+    - containerPort: 1234
+    imagePullPolicy: IfNotPresent
+    livenessProbe:
+      tcpSocket:
+        port: 1234
+      initialDelaySeconds: 5
+      periodSeconds: 5
+  restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {service_name}
+  labels:
+    app: kptunnel-{tunnel_id}
+    tunnel: {tunnel_id}
+spec:
+  selector:
+    app: kptunnel-{tunnel_id}
+  ports:
+    - port: 1234
+      targetPort: 1234

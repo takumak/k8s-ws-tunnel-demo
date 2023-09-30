@@ -146,42 +146,86 @@ class ReverseTunnel(Tunnel):
         return host, port
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-L', type=ForwardTunnel)
-    parser.add_argument('-R', type=ReverseTunnel)
-    args = parser.parse_args()
+class Subcommand:
+    subcommands = None
 
-    if args.L and args.R:
-        log.error('Argument -L and -R cannot be used together')
-        sys.exit(1)
+    def __init__(self, subparsers):
+        self.parser = subparsers.add_parser(self.command_name)
+        self.add_args(self.parser)
+        self.parser.set_defaults(run=self.run)
+        if self.subcommands:
+            self.subparsers = self.parser.add_subparsers(title='commands', required=True)
+            for subcommand_class in self.subcommands:
+                subcommand = subcommand_class(self.subparsers)
+                setattr(self, subcommand.command_name, subcommand)
 
-    if args.L:
-        tunnel = args.L
-    elif args.R:
-        tunnel = args.R
-    else:
-        log.error('Either -L or -R must be specified')
-        sys.exit(1)
-
-    try:
-        tunnel.start_server()
-        log.info(f'ws url: {tunnel.ws_url}')
-
-        host, port = tunnel.listening_on()
-        log.info(f'listening on {host}:{port}')
-        with tempfile.NamedTemporaryFile(prefix='kptunnel-', suffix='.log') as logfile:
-            log.info(f'kptunnel log -> {logfile.name}')
-            log.info('Press [Ctrl+C] to stop tunneling')
-            while True:
-                tunnel.start_client(logfile)
-                time.sleep(1)
-
-    except KeyboardInterrupt:
+    def add_args(self, parser):
         pass
-    finally:
-        log.info('cleanup')
-        tunnel.stop_server()
+
+    def run(self, args):
+        print(self.command_name)
+
+
+class TunnelCommand(Subcommand):
+    command_name = 'tunnel'
+
+    def add_args(self, parser):
+        parser.add_argument('-L', type=ForwardTunnel)
+        parser.add_argument('-R', type=ReverseTunnel)
+        pass
+
+    def run(self, args):
+        if args.L and args.R:
+            log.error('Argument -L and -R cannot be used together')
+            sys.exit(1)
+
+        if args.L:
+            tunnel = args.L
+        elif args.R:
+            tunnel = args.R
+        else:
+            log.error('Either -L or -R must be specified')
+            sys.exit(1)
+
+        try:
+            tunnel.start_server()
+            log.info(f'ws url: {tunnel.ws_url}')
+
+            host, port = tunnel.listening_on()
+            log.info(f'listening on {host}:{port}')
+            with tempfile.NamedTemporaryFile(prefix='kptunnel-', suffix='.log') as logfile:
+                log.info(f'kptunnel log -> {logfile.name}')
+                log.info('Press [Ctrl+C] to stop tunneling')
+                while True:
+                    tunnel.start_client(logfile)
+                    time.sleep(1)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            log.info('cleanup')
+            tunnel.stop_server()
+
+class ArgumentParser:
+    subcommands = [
+        TunnelCommand,
+    ]
+
+    def __init__(self):
+        self.parser = argparse.ArgumentParser()
+        self.subparsers = self.parser.add_subparsers(title='commands', required=True)
+        for subcommand_class in self.subcommands:
+            subcommand = subcommand_class(self.subparsers)
+            setattr(self, subcommand.command_name, subcommand)
+
+    def parse_args(self):
+        return self.parser.parse_args()
+
+
+def main():
+    parser = ArgumentParser()
+    args = parser.parse_args()
+    args.run(args)
 
 
 if __name__ == '__main__':

@@ -7,96 +7,181 @@ import random
 import string
 import subprocess
 import time
+import json
+import tempfile
+
+
+log = logging.getLogger('mktunnel')
+log.setLevel(logging.INFO)
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.INFO)
+handler_format = logging.Formatter('%(asctime)s [%(filename)s:%(lineno)s] %(message)s')
+stream_handler.setFormatter(handler_format)
+log.addHandler(stream_handler)
+
+
+kptunnel_bin = os.path.join(os.path.dirname(__file__), 'kptunnel')
+if not os.path.exists(kptunnel_bin):
+    log.error('kptunnel command not found')
+    sys.exit(1)
+
+
+def kubectl(args, stdin=None, json_output=False):
+    p = subprocess.run(
+        [
+            'kubectl',
+            *args,
+            *(['-o', 'json'] if json_output else []),
+        ],
+        capture_output=True,
+        check=True,
+        input=stdin,
+        encoding='utf-8',
+        errors='ignore',
+    )
+    if json_output:
+        return json.loads(p.stdout)
+
+
+def get_control_plane_ip():
+    nodes = kubectl(['get', 'node', '-l', 'node-role.kubernetes.io/control-plane='], json_output=True)
+    node = nodes['items'][0]
+    for a in node['status']['addresses']:
+        if a['type'] == 'InternalIP':
+            return a['address']
+    raise RuntimeError('Failed to get control plane ip')
+
+
+class Tunnel:
+    def __init__(self, bind_address, listen_port, forward_to_host, forward_to_port):
+        self.bind_address = bind_address
+        self.listen_port = listen_port
+        self.forward_to_host = forward_to_host
+        self.forward_to_port = forward_to_port
+        self.tunnel_id = ''.join(random.choices(string.ascii_lowercase, k=16))
+        self.ws_service_name = f'ws-{self.tunnel_id}'
+        self.tun_service_name = f'tun-{self.tunnel_id}'
+
+    def format(self, fmt):
+        return fmt.format(
+            bind_address = self.bind_address,
+            listen_port = self.listen_port,
+            forward_to_host = self.forward_to_host,
+            forward_to_port = self.forward_to_port,
+            tunnel_id = self.tunnel_id,
+            ws_service_name = self.ws_service_name,
+            tun_service_name = self.tun_service_name,
+        )
+
+    def start_server(self):
+        with open(self.yaml_filename) as f:
+            yaml_template = f.read()
+        yaml_src = self.format(yaml_template)
+
+        log.info('starting tunnel server')
+        kubectl(['create', '-f', '-'], yaml_src)
+        log.info('waiting for tunnel server ready')
+        kubectl(['wait', 'pod', '-l', f'tunnel={self.tunnel_id}', '--for=condition=Ready'])
+
+    def stop_server(self):
+        kubectl(['delete', 'all', '-l', f'tunnel={self.tunnel_id}'])
+
+    def start_client(self, logfile):
+        cmd = [
+            kptunnel_bin,
+            self.kptunnel_client_mode,
+            '-wspath', f'/{self.ws_service_name}',
+            'localhost:80',
+            f'{self.bind_address}:{self.listen_port},{self.forward_to_host}:{self.forward_to_port}'
+        ]
+        subprocess.run(cmd, check=True, stdout=logfile, stderr=logfile)
+
+    @property
+    def ws_url(self):
+        return f'ws://localhost/{self.ws_service_name}'
+
+
+class ForwardTunnel(Tunnel):
+    yaml_filename = 'forward.yaml'
+    kptunnel_client_mode = 'wsclient'
+
+    def __init__(self, spec):
+        m = re.match(r'^([a-zA-Z0-9\-\.]*):(\d+):([a-zA-Z0-9\-\.]+):(\d+)$', spec)
+        if not m:
+            raise ValueError(
+                f'Invalid tunnel spec: {repr(spec)}'
+                + ' (should be <bind-address>:<listen-port>:<forward-host>:<forward-port>)')
+        super().__init__(
+            bind_address = m.group(1),
+            listen_port = int(m.group(2), 10),
+            forward_to_host = m.group(3),
+            forward_to_port = int(m.group(4), 10),
+        )
+
+    def listening_on(self):
+        return self.bind_address, self.listen_port
+
+
+class ReverseTunnel(Tunnel):
+    yaml_filename = 'reverse.yaml'
+    kptunnel_client_mode = 'r-wsclient'
+
+    def __init__(self, spec):
+        m = re.match(r'^([a-zA-Z0-9\-\.]+):(\d+)$', spec)
+        if not m:
+            raise ValueError(
+                f'Invalid tunnel spec: {repr(spec)}'
+                + ' (should be <forward-host>:<forward-port>)')
+        super().__init__(
+            bind_address = '',
+            listen_port = 8888,
+            forward_to_host = m.group(1),
+            forward_to_port = int(m.group(2), 10),
+        )
+
+    def listening_on(self):
+        host = get_control_plane_ip()
+        svc = kubectl(['get', 'svc', self.tun_service_name], json_output=True)
+        port = svc['spec']['ports'][0]['nodePort']
+        return host, port
 
 
 def main():
-    kptunnel_bin = os.path.join(os.path.dirname(__file__), 'kptunnel')
-    if not os.path.exists(kptunnel_bin):
-        logging.error('kptunnel command not found')
-        sys.exit(1)
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('-L')
-    parser.add_argument('-R')
+    parser.add_argument('-L', type=ForwardTunnel)
+    parser.add_argument('-R', type=ReverseTunnel)
     args = parser.parse_args()
 
     if args.L and args.R:
-        logging.error('Argument -L and -R cannot be used together')
+        log.error('Argument -L and -R cannot be used together')
         sys.exit(1)
 
     if args.L:
-        yaml_filename = 'forward.yaml'
-        spec = args.L
+        tunnel = args.L
     elif args.R:
-        yaml_filename = 'reverse.yaml'
-        spec = args.R
+        tunnel = args.R
     else:
-        logging.error('Either -L or -R must be specified')
+        log.error('Either -L or -R must be specified')
         sys.exit(1)
-
-    m = re.match(r'^([a-zA-Z0-9\-\.]*):(\d+):([a-zA-Z0-9\-\.]+):(\d+)$', spec)
-    if not m:
-        logging.error(f'Invalid tunnel spec: {repr(spec)}'
-                      + ' (should be bind-address:listen-port:forward-host:forward-port)')
-        sys.exit(1)
-
-    bind_address = m.group(1)
-    listen_port = int(m.group(2), 10)
-    forward_to_host = m.group(3)
-    forward_to_port = int(m.group(4))
-    tunnel_id = ''.join(random.choices(string.ascii_lowercase, k=16))
-    service_name = f'tunnel-{tunnel_id}'
-
-    with open(yaml_filename) as f:
-        yaml_template = f.read()
-
-    yaml_src = yaml_template.format(
-        bind_address = bind_address,
-        listen_port = listen_port,
-        forward_to_host = forward_to_host,
-        forward_to_port = forward_to_port,
-        tunnel_id = tunnel_id,
-        service_name = service_name,
-    )
 
     try:
-        logging.info('create pod')
-        subprocess.run(
-            ['kubectl', 'create', '-f', '-'],
-            input=yaml_src.encode('utf-8'),
-            check=True,
-        )
+        tunnel.start_server()
+        log.info(f'ws url: {tunnel.ws_url}')
 
-        logging.info('wait for ready')
-        subprocess.run(
-            ['kubectl', 'wait', 'pod', '-l', f'tunnel={tunnel_id}', '--for=condition=Ready'],
-            check=True,
-        )
-
-        logging.info(f'endpoint: ws://localhost/tunnel-{tunnel_id}')
-
-        logging.info(f'start listening on {bind_address}:{listen_port}')
-
-        while True:
-            subprocess.run(
-                [
-                    kptunnel_bin,
-                    'wsclient',
-                    '-wspath', f'/{service_name}',
-                    'localhost:80',
-                    f'{bind_address}:{listen_port},{forward_to_host}:{forward_to_port}'
-                ],
-                check=True,
-            )
+        host, port = tunnel.listening_on()
+        log.info(f'listening on {host}:{port}')
+        with tempfile.NamedTemporaryFile(prefix='kptunnel-', suffix='.log') as logfile:
+            log.info(f'kptunnel log -> {logfile.name}')
+            log.info('Press [Ctrl+C] to stop tunneling')
+            while True:
+                tunnel.start_client(logfile)
+                time.sleep(1)
 
     except KeyboardInterrupt:
         pass
     finally:
-        print('cleanup')
-        subprocess.run(
-            ['kubectl', 'delete', 'all', '-l', f'tunnel={tunnel_id}'],
-            check=True,
-        )
+        log.info('cleanup')
+        tunnel.stop_server()
 
 
 if __name__ == '__main__':
